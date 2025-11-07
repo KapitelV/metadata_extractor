@@ -1,6 +1,6 @@
 from sql_file_processor import process_sql_directory
 
-sql_path = "C:\\pyworks\\Datasets\\SQLs\\DML\\Teradata\\minsheng\\PDB_TD\\sqls"
+sql_path = "C:\\pyworks\\Datasets\\SQLs\\DML\\Teradata\\minsheng\\ODB_TD\\sqls"
 
 res=process_sql_directory(
     directory_path = sql_path,

@@ -30,6 +30,11 @@ def verify_sqlite_structure():
             "primary_key": "id",
             "foreign_keys": ["table_id"]
         },
+        "foreign_keys": {
+            "columns": ["id", "fk_column_id", "referenced_table_id", "referenced_column_id", "constraint_name", "created_at"],
+            "primary_key": "id",
+            "foreign_keys": ["fk_column_id", "referenced_table_id", "referenced_column_id"]
+        },
         "sql_scripts": {
             "columns": ["id", "script_name", "script_content", "script_type", 
                        "script_purpose", "author", "description", "execution_frequency", "execution_order", 
@@ -38,17 +43,32 @@ def verify_sqlite_structure():
             "primary_key": "id",
             "foreign_keys": []
         },
-        "data_lineage": {
-            "columns": ["id", "target_table_id", "source_table_id", "script_id", "lineage_type", 
-                       "transformation_logic", "columns_mapping_json", "filter_conditions", "created_at"],
+        "script_statements": {
+            "columns": ["id", "script_id", "statement_index", "statement_type", "statement_content", 
+                       "target_table_id", "description", "created_at"],
+            "primary_key": "id",
+            "foreign_keys": ["script_id", "target_table_id"]
+        },
+        "data_lineage_detail": {
+            "columns": ["id", "target_table_id", "source_table_id", "script_id", "statement_id", 
+                       "transformation_logic", "filter_conditions", "created_at"],
+            "primary_key": "id",
+            "foreign_keys": ["target_table_id", "source_table_id", "script_id", "statement_id"]
+        },
+        "data_lineage_summary": {
+            "columns": ["id", "target_table_id", "source_table_id", "script_id", "created_at"],
             "primary_key": "id",
             "foreign_keys": ["target_table_id", "source_table_id", "script_id"]
         },
-        "script_dependencies": {
-            "columns": ["id", "script_id", "source_table_id", "dependency_type", "usage_pattern", 
-                       "columns_used_json", "join_conditions", "filter_conditions", "created_at"],
+        "column_lineage_detail": {
+            "columns": ["id", "target_column_id", "source_column_id", "script_id", "statement_id", "created_at"],
             "primary_key": "id",
-            "foreign_keys": ["script_id", "source_table_id"]
+            "foreign_keys": ["target_column_id", "source_column_id", "script_id", "statement_id"]
+        },
+        "column_lineage_summary": {
+            "columns": ["id", "target_column_id", "source_column_id", "script_id", "created_at"],
+            "primary_key": "id",
+            "foreign_keys": ["target_column_id", "source_column_id", "script_id"]
         },
         "vector_mappings": {
             "columns": ["id", "object_type", "object_id", "collection_name", "vector_id", "description", "created_at"],
@@ -60,23 +80,50 @@ def verify_sqlite_structure():
     # 定义预期的视图
     expected_views = [
         "v_table_complete_info",
-        "v_script_dependencies_detail", 
-        "v_data_lineage_detail"
+        "v_data_lineage",
+        "v_data_lineage_statements",
+        "v_data_lineage_with_path",
+        "v_column_lineage",
+        "v_column_lineage_statements",
+        "v_temp_table_lifecycle",
+        "v_script_execution_flow"
     ]
     
     # 定义预期的索引
     expected_indexes = [
+        # 元数据索引
         "idx_tables_name",
-        "idx_tables_type", 
+        "idx_tables_type",
+        "idx_tables_script",
         "idx_columns_table_name",
         "idx_columns_data_type",
+        # 脚本索引
         "idx_scripts_type",
         "idx_scripts_active",
-        "idx_script_deps_script",
-        "idx_script_deps_source",
-        "idx_lineage_target",
-        "idx_lineage_source",
-        "idx_lineage_script",
+        "idx_script_statements_script",
+        "idx_script_statements_type",
+        "idx_script_statements_target",
+        # 表级血缘索引
+        "idx_lineage_detail_target",
+        "idx_lineage_detail_source",
+        "idx_lineage_detail_script",
+        "idx_lineage_detail_statement",
+        "idx_lineage_summary_target",
+        "idx_lineage_summary_source",
+        "idx_lineage_summary_script",
+        # 字段级血缘索引
+        "idx_col_lineage_detail_target",
+        "idx_col_lineage_detail_source",
+        "idx_col_lineage_detail_script",
+        "idx_col_lineage_detail_statement",
+        "idx_col_lineage_summary_target",
+        "idx_col_lineage_summary_source",
+        "idx_col_lineage_summary_script",
+        # 外键索引
+        "idx_foreign_keys_fk_column",
+        "idx_foreign_keys_referenced_table",
+        "idx_foreign_keys_referenced_column",
+        # 向量映射索引
         "idx_vector_mappings_object",
         "idx_vector_mappings_collection",
         "idx_vector_mappings_vector_id"
