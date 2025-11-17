@@ -3,6 +3,74 @@ from sqlglot import exp
 from typing import Dict, List, Set, Optional
 
 
+def get_statement_type(ast: exp.Expression) -> str:
+    """
+    获取更精细的语句类型，用于冲突处理策略
+
+    Args:
+        ast: sqlglot解析后的AST
+
+    Returns:
+        语句类型字符串
+    """
+    if isinstance(ast, exp.Create):
+        return 'CREATE_TABLE'  # 完整字段定义
+
+    elif isinstance(ast, exp.Insert):
+        # 检查是否显式指定了列名
+        schema = ast.find(exp.Schema)
+        if schema and schema.expressions:
+            return 'INSERT_EXPLICIT'  # INSERT(col1,col2) - 字段可能不完整
+        else:
+            return 'INSERT_VALUES'   # INSERT VALUES - 字段可能不完整
+
+    elif isinstance(ast, exp.Update):
+        return 'UPDATE'  # 部分字段更新
+
+    elif isinstance(ast, exp.Merge):
+        return 'MERGE'  # 复杂操作
+
+    else:
+        return 'OTHER'
+
+
+def _classify_statement_type(parsed_sql: exp.Expression) -> str:
+    """
+    分类SQL语句类型，用于字段信息优先级判断
+
+    Returns:
+        - 'CREATE_TABLE': CREATE TABLE (col1, col2, col3)
+        - 'CREATE_TABLE_AS': CREATE TABLE AS SELECT
+        - 'CREATE_VIEW': CREATE VIEW
+        - 'INSERT_SELECT': INSERT INTO ... SELECT
+        - 'INSERT_VALUES': INSERT INTO ... VALUES
+        - 'UPDATE': UPDATE ... SET
+        - 'MERGE': MERGE INTO
+        - 'UNKNOWN': 未知类型
+    """
+    if isinstance(parsed_sql, exp.Create):
+        if parsed_sql.kind and parsed_sql.kind.upper() == 'TABLE':
+            if parsed_sql.expression:
+                return 'CREATE_TABLE_AS'
+            else:
+                return 'CREATE_TABLE'
+        elif parsed_sql.kind and parsed_sql.kind.upper() == 'VIEW':
+            return 'CREATE_VIEW'
+        else:
+            return 'UNKNOWN'
+    elif isinstance(parsed_sql, exp.Insert):
+        if parsed_sql.expression and isinstance(parsed_sql.expression, exp.Select):
+            return 'INSERT_SELECT'
+        else:
+            return 'INSERT_VALUES'
+    elif isinstance(parsed_sql, exp.Update):
+        return 'UPDATE'
+    elif isinstance(parsed_sql, exp.Merge):
+        return 'MERGE'
+    else:
+        return 'UNKNOWN'
+
+
 def extract_sql_metadata(sql: str, dialect: str = None) -> Dict:
     """
     从SQL语句中提取元数据信息
@@ -15,8 +83,9 @@ def extract_sql_metadata(sql: str, dialect: str = None) -> Dict:
     Returns:
         包含以下键的字典：
         - target_table: {"schema_nm": "schema名称", "tbl_en_nm": "表名"}
-        - target_columns: [{"col_en_nm": "字段英文名称", "col_cn_nm": "字段中文名称"}, ...]
+        - target_columns: [{"col_no": 序号, "col_en_nm": "字段英文名称", "col_cn_nm": "字段中文名称", "is_target_field": True/False}, ...]
         - source_tables: [{"schema_nm": "schema名称", "tbl_en_nm": "表名"}, ...]
+        - statement_type: 语句类型分类
     """
     try:
         # 解析SQL为AST
@@ -26,15 +95,16 @@ def extract_sql_metadata(sql: str, dialect: str = None) -> Dict:
         result = {
             "target_table": {"schema_nm": "", "tbl_en_nm": ""},
             "target_columns": [],
-            "source_tables": []
+            "source_tables": [],
+            "statement_type": _classify_statement_type(parsed)
         }
         
         # 提取目标表信息
         target_table = _extract_target_table(parsed)
         result["target_table"] = target_table
         
-        # 提取目标字段信息
-        target_columns = _extract_target_columns(parsed)
+        # 提取目标字段信息（区分目标字段和源字段注释）
+        target_columns = _extract_target_columns_with_priority(parsed, result["statement_type"])
         result["target_columns"] = target_columns
         
         # 提取来源表信息
@@ -202,6 +272,136 @@ def _extract_target_table(parsed_sql: exp.Expression) -> Dict[str, str]:
                 result["schema_nm"] = str(table_expr.db)
                 
     return result
+
+
+def _extract_target_columns_with_priority(parsed_sql: exp.Expression, statement_type: str) -> List[Dict]:
+    """
+    提取目标字段信息，区分目标字段和源字段注释，并标记字段来源类型
+
+    Args:
+        parsed_sql: sqlglot解析后的AST
+        statement_type: 语句类型分类
+
+    Returns:
+        [{"col_no": 序号, "col_en_nm": "字段英文名称", "col_cn_nm": "字段中文名称", "is_target_field": True/False, "source_type": "语句类型"}, ...]
+    """
+    columns = []
+
+    # INSERT语句 - 目标字段优先级最高
+    if isinstance(parsed_sql, exp.Insert):
+        if parsed_sql.expression:
+            schema = parsed_sql.find(exp.Schema)
+            if schema:
+                # 首先从Schema获取目标字段名和注释（优先级最高）
+                for expr in schema.expressions:
+                    col_info = _extract_column_info(expr)
+                    if col_info:
+                        col_info["is_target_field"] = True
+                        col_info["source_type"] = statement_type
+                        columns.append(col_info)
+
+                # 然后从SELECT的投影列中获取源字段注释（优先级较低）
+                select_expr = parsed_sql.expression
+                if isinstance(select_expr, exp.Select) and select_expr.expressions:
+                    # 如果字段数量匹配，添加源字段注释
+                    if len(select_expr.expressions) == len(columns):
+                        for i, projection in enumerate(select_expr.expressions):
+                            if hasattr(projection, 'comments') and projection.comments:
+                                source_comment = " ".join(projection.comments).strip()
+                                # 如果目标字段没有注释，使用源字段注释
+                                if not columns[i]["col_cn_nm"]:
+                                    columns[i]["col_cn_nm"] = source_comment
+                                    columns[i]["is_target_field"] = False  # 标记为源字段注释
+
+    # UPDATE语句 - 目标字段（被更新的字段）
+    elif isinstance(parsed_sql, exp.Update):
+        if parsed_sql.expressions:
+            for set_item in parsed_sql.expressions:
+                if isinstance(set_item, exp.EQ) and set_item.this:
+                    if isinstance(set_item.this, exp.Column):
+                        col_info = _extract_column_info(set_item.this)
+                        if col_info:
+                            col_info["is_target_field"] = True
+                            col_info["source_type"] = statement_type
+                            # 注释可能在EQ节点上（逗号后的注释）或右边的表达式上（行尾注释）
+                            if hasattr(set_item, 'comments') and set_item.comments:
+                                col_info["col_cn_nm"] = " ".join(set_item.comments).strip()
+                            elif hasattr(set_item.expression, 'comments') and set_item.expression.comments:
+                                col_info["col_cn_nm"] = " ".join(set_item.expression.comments).strip()
+                            columns.append(col_info)
+
+    # MERGE语句 - 从WHEN MATCHED/NOT MATCHED子句中提取列
+    elif isinstance(parsed_sql, exp.Merge):
+        # 从WHEN MATCHED THEN UPDATE中提取（目标字段）
+        for when_matched in parsed_sql.find_all(exp.When):
+            for set_item in when_matched.find_all(exp.EQ):
+                if set_item.this and isinstance(set_item.this, exp.Column):
+                    col_info = _extract_column_info(set_item.this)
+                    if col_info:
+                        col_info["is_target_field"] = True
+                        col_info["source_type"] = statement_type
+                        # 注释可能在EQ节点上（逗号后的注释）或右边的表达式上（行尾注释）
+                        if hasattr(set_item, 'comments') and set_item.comments:
+                            col_info["col_cn_nm"] = " ".join(set_item.comments).strip()
+                        elif hasattr(set_item.expression, 'comments') and set_item.expression.comments:
+                            col_info["col_cn_nm"] = " ".join(set_item.expression.comments).strip()
+                        if col_info not in columns:
+                            columns.append(col_info)
+
+        # 从WHEN NOT MATCHED THEN INSERT中提取（目标字段）
+        for schema in parsed_sql.find_all(exp.Schema):
+            for expr in schema.expressions:
+                col_info = _extract_column_info(expr)
+                if col_info:
+                    col_info["is_target_field"] = True
+                    col_info["source_type"] = statement_type
+                    if col_info not in columns:
+                        columns.append(col_info)
+
+    # CREATE TABLE AS语句 - 从SELECT的投影列中提取目标字段
+    elif isinstance(parsed_sql, exp.Create):
+        # 首先尝试从显式的Schema定义中提取（如果有）
+        schema = parsed_sql.find(exp.Schema)
+        if schema and schema.expressions:
+            for expr in schema.expressions:
+                col_info = _extract_column_info(expr)
+                if col_info:
+                    col_info["is_target_field"] = True
+                    col_info["source_type"] = statement_type
+                    columns.append(col_info)
+        # 如果没有显式Schema，从SELECT的投影列中提取
+        elif parsed_sql.expression:
+            select_expr = parsed_sql.expression
+            if isinstance(select_expr, exp.Select):
+                columns = _extract_select_columns_with_priority(select_expr, statement_type)
+            elif hasattr(select_expr, 'this') and isinstance(select_expr.this, exp.Select):
+                columns = _extract_select_columns_with_priority(select_expr.this, statement_type)
+
+    # 为所有字段添加序号，并调整字段顺序
+    result_columns = []
+    for i, col in enumerate(columns, start=1):
+        result_columns.append({
+            "col_no": i,
+            "col_en_nm": col["col_en_nm"],
+            "col_cn_nm": col["col_cn_nm"],
+            "is_target_field": col.get("is_target_field", False),
+            "source_type": col.get("source_type", statement_type)
+        })
+
+    return result_columns
+
+
+def _extract_select_columns_with_priority(select_expr: exp.Select, statement_type: str) -> List[Dict]:
+    """从SELECT语句的投影列中提取字段信息（用于CREATE TABLE AS）"""
+    columns = []
+    if select_expr.expressions:
+        for expr in select_expr.expressions:
+            col_info = _extract_column_info(expr)
+            if col_info:
+                col_info["is_target_field"] = True  # CREATE TABLE AS的目标字段
+                col_info["source_type"] = statement_type
+                columns.append(col_info)
+    return columns
 
 
 def _extract_target_columns(parsed_sql: exp.Expression) -> List[Dict[str, str]]:

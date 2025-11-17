@@ -23,7 +23,7 @@ from typing import Dict, List, Tuple, Optional, Set
 import sqlglot
 from sqlglot import exp
 import networkx as nx
-from metadata_extractor import extract_ddl_metadata, extract_sql_metadata
+from metadata_extractor import extract_ddl_metadata, extract_sql_metadata, _classify_statement_type
 
 
 def process_sql_file(
@@ -77,24 +77,31 @@ def process_sql_file(
                 continue
                 
             try:
-                statement_type = _identify_statement_type(parsed_sql)
+                # 使用_classify_statement_type获取细粒度类型
+                statement_type = _classify_statement_type(parsed_sql)
                 
-                if statement_type == 'DDL':
-                    print(f"  [{idx}] DDL语句 - {type(parsed_sql).__name__}")
+                # 根据类型判断是DDL还是DML
+                ddl_types = {'CREATE_TABLE', 'CREATE_TABLE_AS', 'CREATE_VIEW'}
+                dml_types = {'INSERT_SELECT', 'INSERT_VALUES', 'UPDATE', 'MERGE'}
+                
+                if statement_type in ddl_types:
+                    print(f"  [{idx}] DDL语句 ({statement_type}) - {type(parsed_sql).__name__}")
                     metadata = extract_ddl_metadata(parsed_sql.sql(dialect=dialect), dialect=dialect)
+                    metadata['statement_type'] = statement_type
                     metadata['_type'] = 'DDL'
                     metadata['_ast'] = parsed_sql
                     extracted_data.append(metadata)
                     
-                elif statement_type == 'DML':
-                    print(f"  [{idx}] DML语句 - {type(parsed_sql).__name__}")
+                elif statement_type in dml_types:
+                    print(f"  [{idx}] DML语句 ({statement_type}) - {type(parsed_sql).__name__}")
                     metadata = extract_sql_metadata(parsed_sql.sql(dialect=dialect), dialect=dialect)
+                    metadata['statement_type'] = statement_type
                     metadata['_type'] = 'DML'
                     metadata['_ast'] = parsed_sql
                     extracted_data.append(metadata)
                     
                 else:
-                    print(f"  [{idx}] 跳过语句 - {type(parsed_sql).__name__} (不支持的类型)")
+                    print(f"  [{idx}] 跳过语句 ({statement_type}) - {type(parsed_sql).__name__} (不支持的类型)")
                     
             except Exception as e:
                 return False, f"提取第{idx}条SQL元数据失败: {str(e)}"
@@ -196,20 +203,32 @@ def process_sql_file(
 
 def _identify_statement_type(parsed_sql: exp.Expression) -> str:
     """
-    识别SQL语句类型
-    
+    获取更精细的语句类型
+
     Args:
         parsed_sql: sqlglot解析后的AST
-    
+
     Returns:
-        'DDL' - CREATE语句
-        'DML' - INSERT/UPDATE/MERGE语句
+        'CREATE_TABLE' - CREATE TABLE语句（完整字段定义）
+        'INSERT_EXPLICIT' - INSERT(col1,col2)语句（显式指定列名）
+        'INSERT_VALUES' - INSERT VALUES语句（未显式指定列名）
+        'UPDATE' - UPDATE语句（部分字段更新）
+        'MERGE' - MERGE语句（复杂操作）
         'OTHER' - 其他类型
     """
     if isinstance(parsed_sql, exp.Create):
-        return 'DDL'
-    elif isinstance(parsed_sql, (exp.Insert, exp.Update, exp.Merge)):
-        return 'DML'
+        return 'CREATE_TABLE'
+    elif isinstance(parsed_sql, exp.Insert):
+        # 检查是否显式指定了列名
+        schema = parsed_sql.find(exp.Schema)
+        if schema and schema.expressions:
+            return 'INSERT_EXPLICIT'
+        else:
+            return 'INSERT_VALUES'
+    elif isinstance(parsed_sql, exp.Update):
+        return 'UPDATE'
+    elif isinstance(parsed_sql, exp.Merge):
+        return 'MERGE'
     else:
         return 'OTHER'
 
@@ -229,17 +248,19 @@ def _consolidate_metadata(extracted_data: List[Dict]) -> Dict[str, Dict]:
     tables_data = {}
     
     for metadata in extracted_data:
-        stmt_type = metadata['_type']
         target_table = metadata['target_table']
-        
+
+        # 获取语句类型
+        stmt_type = metadata.get('statement_type', _classify_statement_type(metadata['_ast']))
+
         # 1. 处理目标表
         schema_name = target_table.get('schema_nm', '') or ''
         table_name = target_table.get('tbl_en_nm', '')
-        
+
         if table_name:
             # 使用(schema_name, table_name)作为key
             table_key = (schema_name, table_name)
-            
+
             if table_key not in tables_data:
                 # 确定表类型
                 table_type = _determine_table_type(metadata['_ast'], schema_name)
@@ -252,11 +273,9 @@ def _consolidate_metadata(extracted_data: List[Dict]) -> Dict[str, Dict]:
                     'columns': [],
                     'ast': metadata['_ast']
                 }
-            
-            # 如果当前记录是DDL，更新data_source
-            if stmt_type == 'DDL':
-                tables_data[table_key]['data_source'] = 'DDL'
-                tables_data[table_key]['table_cn_name'] = target_table.get('tbl_cn_nm', '')
+
+            # 更新data_source为更具体的类型
+            tables_data[table_key]['data_source'] = stmt_type
             
             # 整合字段信息
             if 'target_columns' in metadata and metadata['target_columns']:
@@ -269,9 +288,10 @@ def _consolidate_metadata(extracted_data: List[Dict]) -> Dict[str, Dict]:
                             break
                     
                     if existing_col:
-                        # 合并字段信息（优先保留DDL信息）
-                        if stmt_type == 'DDL':
-                            # DDL优先，覆盖原有信息
+                        # 合并字段信息（优先保留建表语句信息）
+                        ddl_types = {'CREATE_TABLE', 'CREATE_TABLE_AS', 'CREATE_VIEW'}
+                        if stmt_type in ddl_types:
+                            # 建表语句优先，覆盖原有信息
                             for key, value in col.items():
                                 if value or key in ['is_null', 'is_pri_key', 'is_foreign_key']:
                                     existing_col[key] = value
@@ -308,6 +328,68 @@ def _consolidate_metadata(extracted_data: List[Dict]) -> Dict[str, Dict]:
                     }
     
     return tables_data
+
+
+def get_conflict_strategy(existing_type: str, new_type: str) -> str:
+    """
+    获取冲突处理策略
+
+    Args:
+        existing_type: 数据库中现有的语句类型
+        new_type: 新的语句类型
+
+    Returns:
+        冲突处理策略: 'ERROR', 'KEEP_CREATE_TABLE', 'SUPPLEMENT_CHINESE_NAMES', 'MERGE_INFO'
+    """
+    # 建表语句优先级最高（包括CREATE_TABLE, CREATE_TABLE_AS, CREATE_VIEW）
+    ddl_types = {'CREATE_TABLE', 'CREATE_TABLE_AS', 'CREATE_VIEW'}
+    
+    if existing_type in ddl_types or new_type in ddl_types:
+        # 如果两个都是建表语句，不允许重复
+        if existing_type in ddl_types and new_type in ddl_types:
+            if existing_type == new_type:
+                return 'ERROR'  # 不允许重复建表
+            else:
+                # 不同类型的建表语句，CREATE_TABLE优先
+                if existing_type == 'CREATE_TABLE' or new_type == 'CREATE_TABLE':
+                    return 'KEEP_CREATE_TABLE'
+                # 其他情况，保留现有的
+                return 'KEEP_CREATE_TABLE'
+
+        # 建表语句总是优先
+        return 'KEEP_CREATE_TABLE'
+
+    # 其他语句的合并策略
+    merge_strategies = {
+        # DDL vs 其他
+        ('CREATE_TABLE_AS', 'INSERT_SELECT'): 'SUPPLEMENT_CHINESE_NAMES',
+        ('CREATE_TABLE_AS', 'INSERT_VALUES'): 'SUPPLEMENT_CHINESE_NAMES',
+        ('CREATE_TABLE_AS', 'UPDATE'): 'SUPPLEMENT_CHINESE_NAMES',
+        ('CREATE_TABLE_AS', 'MERGE'): 'SUPPLEMENT_CHINESE_NAMES',
+
+        # CREATE VIEW vs 其他
+        ('CREATE_VIEW', 'INSERT_SELECT'): 'SUPPLEMENT_CHINESE_NAMES',
+        ('CREATE_VIEW', 'INSERT_VALUES'): 'SUPPLEMENT_CHINESE_NAMES',
+        ('CREATE_VIEW', 'UPDATE'): 'SUPPLEMENT_CHINESE_NAMES',
+        ('CREATE_VIEW', 'MERGE'): 'SUPPLEMENT_CHINESE_NAMES',
+
+        # 非建表语句之间的合并
+        ('INSERT_SELECT', 'INSERT_SELECT'): 'MERGE_INFO',
+        ('INSERT_SELECT', 'INSERT_VALUES'): 'MERGE_INFO',
+        ('INSERT_SELECT', 'UPDATE'): 'MERGE_INFO',
+        ('INSERT_SELECT', 'MERGE'): 'MERGE_INFO',
+
+        ('INSERT_VALUES', 'INSERT_VALUES'): 'MERGE_INFO',
+        ('INSERT_VALUES', 'UPDATE'): 'MERGE_INFO',
+        ('INSERT_VALUES', 'MERGE'): 'MERGE_INFO',
+
+        ('UPDATE', 'UPDATE'): 'MERGE_INFO',
+        ('UPDATE', 'MERGE'): 'MERGE_INFO',
+
+        ('MERGE', 'MERGE'): 'MERGE_INFO',
+    }
+
+    return merge_strategies.get((existing_type, new_type), 'MERGE_INFO')
 
 
 def _process_table_data(cursor: sqlite3.Cursor, table_data: Dict, script_id: str = None):
@@ -349,39 +431,39 @@ def _process_table_data(cursor: sqlite3.Cursor, table_data: Dict, script_id: str
     if existing_table:
         print(f"  ⚠️  表已存在，检测冲突...")
         existing_data_source = existing_table['data_source']
-        
+
         # 如果新数据是EXTERNAL，跳过（已有任何定义都优先）
         if data_source == 'EXTERNAL':
             print(f"  ⏭️  表已存在，跳过外部表创建")
             return
-        
+
         # 如果已存在的是EXTERNAL，用新数据覆盖
         if existing_data_source == 'EXTERNAL':
             print(f"  🔄 用实际定义覆盖外部表记录")
-            if data_source == 'DDL':
-                _update_table_with_ddl(cursor, table_id, table_data, current_script_id)
-            else:  # DML
-                _update_table_with_ddl(cursor, table_id, table_data, current_script_id)
+            _update_table_with_statement(cursor, table_id, table_data, current_script_id, data_source)
             return
-        
-        # 场景1: DDL vs DDL - 报错
-        if existing_data_source == 'DDL' and data_source == 'DDL':
-            raise Exception(f"表 {schema_name}.{table_name} 已存在DDL定义，不允许重复定义")
-        
-        # 场景2: DML vs DDL - DDL覆盖
-        elif existing_data_source == 'DML' and data_source == 'DDL':
-            print(f"  🔄 DML表被DDL覆盖")
-            _update_table_with_ddl(cursor, table_id, table_data, current_script_id)
 
-        # 场景3: DDL vs DML - DDL保持，补充信息
-        elif existing_data_source == 'DDL' and data_source == 'DML':
-            print(f"  ➕ 补充DML信息到DDL表")
-            _supplement_ddl_with_dml(cursor, table_id, table_data, current_script_id)
+        # 获取冲突处理策略
+        strategy = get_conflict_strategy(existing_data_source, data_source)
+        print(f"  🔄 冲突策略: {strategy}")
 
-        # 场景4: DML vs DML - 合并
-        elif existing_data_source == 'DML' and data_source == 'DML':
-            print(f"  🔀 合并DML信息")
-            _merge_dml_with_dml(cursor, table_id, table_data, current_script_id)
+        if strategy == 'ERROR':
+            raise Exception(f"表 {schema_name}.{table_name} 冲突不允许: {existing_data_source} vs {data_source}")
+
+        elif strategy == 'KEEP_CREATE_TABLE':
+            # 建表语句优先，覆盖其他定义
+            print(f"  🔄 建表语句优先覆盖")
+            _update_table_with_statement(cursor, table_id, table_data, current_script_id, data_source)
+
+        elif strategy == 'SUPPLEMENT_CHINESE_NAMES':
+            # 只补充中文名，不检查字段存在性
+            print(f"  ➕ 只补充中文名信息")
+            _supplement_chinese_names_only(cursor, table_id, table_data, current_script_id)
+
+        elif strategy == 'MERGE_INFO':
+            # 正常合并信息
+            print(f"  🔀 合并字段信息")
+            _merge_statement_info(cursor, table_id, table_data, current_script_id, existing_data_source, data_source)
 
     else:
         print(f"  ✨ 新建表记录")
@@ -487,6 +569,174 @@ def _determine_table_type(ast: exp.Expression, schema_name: str) -> str:
     return 'TABLE'
 
 
+def _update_table_with_statement(cursor: sqlite3.Cursor, table_id: str, table_data: Dict, script_id: str = None, new_data_source: str = None):
+    """
+    用新语句完全覆盖表信息
+
+    Args:
+        cursor: 数据库游标
+        table_id: 表ID
+        table_data: 新的表数据
+        script_id: 脚本ID
+        new_data_source: 新的数据源类型
+    """
+    schema_name = table_data['schema_name']
+    table_name = table_data['table_name']
+    table_cn_name = table_data['table_cn_name']
+    table_type = table_data['table_type']
+
+    # 判断是否为临时表
+    is_tmp_table = (table_type == 'TMP_TABLE')
+    current_script_id = script_id if is_tmp_table else ''
+
+    # 更新表基本信息
+    cursor.execute("""
+        UPDATE tables
+        SET database_id = ?, schema_name = ?, table_name = ?, table_type = ?,
+            description = ?, data_source = ?, script_id = ?
+        WHERE id = ?
+    """, (
+        schema_name if schema_name else '',
+        schema_name,
+        table_name,
+        table_type,
+        table_cn_name,
+        new_data_source or table_data.get('data_source', ''),
+        current_script_id,
+        table_id
+    ))
+
+    # 删除现有字段，重新插入
+    cursor.execute("DELETE FROM columns WHERE table_id = ?", (table_id,))
+
+    # 插入新字段
+    _insert_columns(cursor, table_id, schema_name, table_name, table_data['columns'], script_id)
+
+
+def _supplement_chinese_names_only(cursor: sqlite3.Cursor, table_id: str, table_data: Dict, script_id: str = None):
+    """
+    只补充中文名信息，不检查字段存在性
+
+    Args:
+        cursor: 数据库游标
+        table_id: 表ID
+        table_data: 新的表数据
+        script_id: 脚本ID
+    """
+    # 读取现有字段
+    cursor.execute("""
+        SELECT column_name, description
+        FROM columns
+        WHERE table_id = ?
+    """, (table_id,))
+
+    existing_columns = {row['column_name']: row['description'] for row in cursor.fetchall()}
+
+    # 只补充中文名
+    for col in table_data['columns']:
+        col_en_nm = col.get('col_en_nm')
+        col_cn_nm = col.get('col_cn_nm')
+
+        if col_en_nm in existing_columns and col_cn_nm and not existing_columns[col_en_nm]:
+            cursor.execute("""
+                UPDATE columns
+                SET description = ?
+                WHERE table_id = ? AND column_name = ?
+            """, (col_cn_nm, table_id, col_en_nm))
+            print(f"    ➕ 补充字段中文名: {col_en_nm} -> {col_cn_nm}")
+
+
+def _merge_statement_info(cursor: sqlite3.Cursor, table_id: str, table_data: Dict, script_id: str = None,
+                         existing_data_source: str = None, new_data_source: str = None):
+    """
+    合并语句信息，允许新增字段
+
+    Args:
+        cursor: 数据库游标
+        table_id: 表ID
+        table_data: 新的表数据
+        script_id: 脚本ID
+        existing_data_source: 现有数据源类型
+        new_data_source: 新数据源类型
+    """
+    schema_name = table_data['schema_name']
+    table_name = table_data['table_name']
+
+    # 读取现有字段
+    cursor.execute("""
+        SELECT column_name, data_type, is_nullable, default_value,
+               is_primary_key, is_foreign_key, description, ordinal_position
+        FROM columns
+        WHERE table_id = ?
+    """, (table_id,))
+
+    existing_columns = {row['column_name']: dict(row) for row in cursor.fetchall()}
+
+    # 处理新字段
+    for col in table_data['columns']:
+        col_en_nm = col.get('col_en_nm')
+
+        if col_en_nm in existing_columns:
+            # 字段已存在，合并信息
+            existing = existing_columns[col_en_nm]
+            col_cn_nm = col.get('col_cn_nm')
+
+            # 检查中文名冲突
+            if col_cn_nm and existing['description'] and col_cn_nm != existing['description']:
+                print(f"    ⚠️ 字段中文名冲突: {schema_name}.{table_name}.{col_en_nm}")
+                print(f"       现有: '{existing['description']}', 新: '{col_cn_nm}'")
+                # 保留现有中文名（按时间优先）
+
+            # 补充缺失的中文名
+            elif col_cn_nm and not existing['description']:
+                cursor.execute("""
+                    UPDATE columns
+                    SET description = ?
+                    WHERE table_id = ? AND column_name = ?
+                """, (col_cn_nm, table_id, col_en_nm))
+                print(f"    ➕ 补充字段中文名: {col_en_nm} -> {col_cn_nm}")
+
+        else:
+            # 新字段，添加它
+            print(f"    ➕ 新增字段: {col_en_nm}")
+            _insert_single_column(cursor, table_id, schema_name, table_name, col, script_id)
+
+
+def _insert_single_column(cursor: sqlite3.Cursor, table_id: str, schema_name: str, table_name: str,
+                         col: Dict, script_id: str = None):
+    """插入单个字段"""
+    col_no = col.get('col_no', 1)
+    col_en_nm = col.get('col_en_nm', '')
+    col_cn_nm = col.get('col_cn_nm', '')
+    data_type = col.get('data_type', '')
+    is_null = col.get('is_null', True)
+    default_value = col.get('default_value', '')
+    is_pri_key = col.get('is_pri_key', False)
+    is_foreign_key = col.get('is_foreign_key', False)
+
+    # 生成字段ID
+    column_id = _generate_column_id(schema_name, table_name, col_en_nm, script_id if script_id else None)
+
+    cursor.execute("""
+        INSERT INTO columns (
+            id, table_id, column_name, data_type, max_length, is_nullable,
+            default_value, is_primary_key, is_foreign_key, description, ordinal_position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        column_id,
+        table_id,
+        col_en_nm,
+        data_type,
+        None,  # max_length
+        is_null,
+        default_value,
+        is_pri_key,
+        is_foreign_key,
+        col_cn_nm,
+        col_no
+    ))
+
+
 def _insert_new_table(cursor: sqlite3.Cursor, table_data: Dict, script_id: str = None):
     """插入新表"""
     schema_name = table_data['schema_name']
@@ -559,16 +809,19 @@ def _update_table_with_ddl(cursor: sqlite3.Cursor, table_id: str, table_data: Di
     
     existing_col_descriptions = {row['column_name']: row['description'] for row in cursor.fetchall()}
     
+    # 获取实际的data_source（从table_data中）
+    actual_data_source = table_data.get('data_source', 'CREATE_TABLE')
+    
     # 更新表信息（文本字段使用空字符串）
     cursor.execute("""
         UPDATE tables
         SET table_type = ?,
             description = ?,
-            data_source = 'DDL'
+            data_source = ?
         WHERE id = ?
-    """, (table_type, table_cn_name or '', table_id))
+    """, (table_type, table_cn_name or '', actual_data_source, table_id))
     
-    print(f"  ✅ 更新表为DDL")
+    print(f"  ✅ 更新表信息，data_source={actual_data_source}")
     
     # 删除旧字段
     cursor.execute("DELETE FROM columns WHERE table_id = ?", (table_id,))
@@ -900,7 +1153,7 @@ def _create_external_table_record(cursor: sqlite3.Cursor, schema_name: str, tabl
     cursor.execute("""
         INSERT INTO tables (
             id, database_id, schema_name, table_name, table_type,
-            table_cn_name, description, business_purpose, data_source,
+            description, business_purpose, data_source,
             refresh_frequency, row_count, data_size_mb, script_id
         ) VALUES (?, ?, ?, ?, ?, '', '外部表（自动创建）', '', 'EXTERNAL', '', NULL, NULL, '')
     """, (
@@ -1005,7 +1258,7 @@ def _populate_script_tables(
             continue
         
         statement_id = f"{script_id}__STMT_{idx:03d}"
-        statement_type = _identify_statement_type(parsed_sql)
+        statement_type = _classify_statement_type(parsed_sql)
         statement_content = parsed_sql.sql()
         
         # 提取该语句的目标表
@@ -1366,7 +1619,8 @@ if __name__ == "__main__":
         # print("示例: python sql_file_processor.py test.sql mysql")
         # sys.exit(1)
         
-        sql_file = "C:\\pyworks\\Datasets\\SQLs\\DML\\Teradata\\minsheng\\MDB_TD\\sqls\\ccr88_eco_f_ivt_prd_ofl_dbt_if_mdm_10200.pl.12.sql"
+        sql_file = "C:\\pyworks\\Datasets\\SQLs\\DML\\Teradata\\minsheng\\MDB_TD\\sqls\\dm88_op_cnt_camp_ac_cs_ex_situ_mdm_10200.pl.1609.sql"
+        sql_file = "C:\\pyworks\\Datasets\\SQLs\\DML\\Teradata\\minsheng\\MDB_TD\\sqls\\dm88_op_cnt_camp_ac_stat_trace_mdm_10200.pl.1615.sql"
         dialect = "teradata"
 
     else:
