@@ -157,7 +157,7 @@ def process_sql_file(
                     conn.rollback()
                     return False, f"处理表 {table_key} 时出错: {str(e)}"
             
-            # 11. 填充sql_scripts、data_lineage、script_dependencies表
+            # 11. 填充sql_scripts、script_statements、data_lineage_detail表
             print(f"\n📝 正在填充脚本信息...")
             _populate_script_tables(
                 cursor, 
@@ -166,7 +166,9 @@ def process_sql_file(
                 target_tables,  # 传入目标表集合（可能多个）
                 source_tables,
                 extracted_data,
-                dependency_graph
+                dependency_graph,
+                parsed_statements,  # 新增：传递解析后的语句
+                script_id
             )
             print(f"✅ 脚本信息已保存")
             
@@ -910,6 +912,47 @@ def _create_external_table_record(cursor: sqlite3.Cursor, schema_name: str, tabl
     ))
 
 
+def _cleanup_script_data(cursor: sqlite3.Cursor, script_id: str) -> None:
+    """
+    清理脚本的旧数据（为增量更新做准备）
+    
+    在重新处理脚本前，删除该脚本的所有相关数据，确保数据一致性。
+    
+    Args:
+        cursor: 数据库游标
+        script_id: 脚本ID
+    """
+    # 检查脚本是否存在
+    cursor.execute("SELECT id FROM sql_scripts WHERE id = ?", (script_id,))
+    if not cursor.fetchone():
+        # 脚本不存在，无需清理
+        return
+    
+    deleted_counts = {}
+    
+    # 1. 删除summary（必须先删除，因为依赖detail）
+    cursor.execute("DELETE FROM data_lineage_summary WHERE script_id = ?", (script_id,))
+    deleted_counts['summary'] = cursor.rowcount
+    
+    # 2. 删除detail
+    cursor.execute("DELETE FROM data_lineage_detail WHERE script_id = ?", (script_id,))
+    deleted_counts['detail'] = cursor.rowcount
+    
+    # 3. 删除statements
+    cursor.execute("DELETE FROM script_statements WHERE script_id = ?", (script_id,))
+    deleted_counts['statements'] = cursor.rowcount
+    
+    # 注意：不删除临时表，因为：
+    # 1. 临时表可能被其他脚本引用（虽然不常见）
+    # 2. 临时表会在下次处理时自动更新
+    # 3. 如果需要清理，可以手动处理
+    
+    if any(deleted_counts.values()):
+        print(f"  🧹 清理旧数据: summary={deleted_counts['summary']}, "
+              f"detail={deleted_counts['detail']}, "
+              f"statements={deleted_counts['statements']}")
+
+
 def _populate_script_tables(
     cursor: sqlite3.Cursor,
     sql_file_path: str,
@@ -917,10 +960,12 @@ def _populate_script_tables(
     target_tables: Set[str],
     source_tables: Set[str],
     extracted_data: List[Dict],
-    dependency_graph: nx.DiGraph
+    dependency_graph: nx.DiGraph,
+    parsed_statements: List[exp.Expression],
+    script_id: str
 ):
     """
-    填充sql_scripts、data_lineage、script_dependencies表
+    填充sql_scripts、script_statements、data_lineage_detail表
     
     Args:
         cursor: 数据库游标
@@ -928,12 +973,16 @@ def _populate_script_tables(
         sql_content: SQL文件内容
         target_tables: 目标表集合（完整名称，如schema.table）
         source_tables: 来源表集合
-        extracted_data: 提取的元数据
+        extracted_data: 提取的元数据（每个元素对应一条语句）
         dependency_graph: 依赖图
+        parsed_statements: 解析后的SQL语句列表
+        script_id: 脚本ID
     """
-    # 生成script_id和script_name（只使用脚本名，不含扩展名）
+    # 生成script_name（只使用脚本名，不含扩展名）
     script_name = os.path.splitext(os.path.basename(sql_file_path))[0]
-    script_id = script_name
+    
+    # 0. 清理旧数据（如果脚本已存在，支持增量更新）
+    _cleanup_script_data(cursor, script_id)
     
     # 1. 插入sql_scripts表（一个脚本只有一条记录）
     cursor.execute("""
@@ -949,92 +998,127 @@ def _populate_script_tables(
         sql_content
     ))
     
-    # 2. 填充data_lineage表 - 为每个目标表和每个来源表的组合创建一条记录
-    for target_table_full_name in target_tables:
-        target_schema, target_name = _parse_full_table_name(target_table_full_name)
+    # 2. 填充script_statements表（按语句）
+    print(f"  📝 填充script_statements表...")
+    for idx, parsed_sql in enumerate(parsed_statements, 1):
+        if parsed_sql is None:
+            continue
         
-        # 尝试查找目标表（先尝试实体表，再尝试临时表）
+        statement_id = f"{script_id}__STMT_{idx:03d}"
+        statement_type = _identify_statement_type(parsed_sql)
+        statement_content = parsed_sql.sql()
+        
+        # 提取该语句的目标表
+        target_table_id = None
+        if idx <= len(extracted_data):
+            metadata = extracted_data[idx - 1]
+            target_table = metadata.get('target_table', {})
+            target_schema = target_table.get('schema_nm', '') or ''
+            target_name = target_table.get('tbl_en_nm', '')
+            
+            if target_name:
+                # 尝试实体表
+                target_table_id = _generate_table_id(target_schema, target_name, None)
+                cursor.execute("SELECT id FROM tables WHERE id = ?", (target_table_id,))
+                if not cursor.fetchone():
+                    # 尝试临时表
+                    target_table_id = _generate_table_id(target_schema, target_name, script_id)
+                    cursor.execute("SELECT id FROM tables WHERE id = ?", (target_table_id,))
+                    if not cursor.fetchone():
+                        target_table_id = None
+        
+        # 插入statement记录
+        cursor.execute("""
+            INSERT OR REPLACE INTO script_statements (
+                id, script_id, statement_index, statement_type,
+                statement_content, target_table_id, description
+            ) VALUES (?, ?, ?, ?, ?, ?, '')
+        """, (
+            statement_id,
+            script_id,
+            idx,
+            statement_type,
+            statement_content,
+            target_table_id
+        ))
+    
+    print(f"  ✅ 已填充 {len([s for s in parsed_statements if s is not None])} 条语句记录")
+    
+    # 3. 填充data_lineage_detail表（按语句）
+    print(f"  📊 填充data_lineage_detail表...")
+    lineage_count = 0
+    
+    for idx, metadata in enumerate(extracted_data, 1):
+        statement_id = f"{script_id}__STMT_{idx:03d}"
+        
+        # 获取该语句的目标表
+        target_table = metadata.get('target_table', {})
+        target_schema = target_table.get('schema_nm', '') or ''
+        target_name = target_table.get('tbl_en_nm', '')
+        
+        if not target_name:
+            continue
+        
+        # 查找目标表ID（先实体表，再临时表）
         target_table_id = _generate_table_id(target_schema, target_name, None)
         cursor.execute("SELECT id FROM tables WHERE id = ?", (target_table_id,))
-        
         if not cursor.fetchone():
-            # 如果实体表不存在，尝试查找临时表（使用当前script_id）
             target_table_id = _generate_table_id(target_schema, target_name, script_id)
             cursor.execute("SELECT id FROM tables WHERE id = ?", (target_table_id,))
-            
             if not cursor.fetchone():
-                print(f"  ⚠️  目标表 {target_table_full_name} 不在数据库中，跳过此目标表的血缘关系")
+                print(f"  ⚠️  语句{idx}的目标表 {target_schema}.{target_name} 不在数据库中，跳过")
                 continue
         
-        # 为当前目标表创建与所有来源表的血缘关系
-        for source_table_full_name in source_tables:
-            source_schema, source_name = _parse_full_table_name(source_table_full_name)
+        # 获取该语句的来源表
+        source_tables_in_stmt = metadata.get('source_tables', [])
+        
+        for source_table in source_tables_in_stmt:
+            source_schema = source_table.get('schema_nm', '') or ''
+            source_name = source_table.get('tbl_en_nm', '')
             
-            # 尝试查找来源表（先尝试实体表，再尝试临时表）
+            if not source_name:
+                continue
+            
+            # 查找来源表ID（先实体表，再临时表）
             source_table_id = _generate_table_id(source_schema, source_name, None)
             cursor.execute("SELECT id FROM tables WHERE id = ?", (source_table_id,))
-            
             if not cursor.fetchone():
-                # 如果实体表不存在，尝试查找临时表（使用当前script_id）
                 source_table_id = _generate_table_id(source_schema, source_name, script_id)
                 cursor.execute("SELECT id FROM tables WHERE id = ?", (source_table_id,))
-                
                 if not cursor.fetchone():
-                    # 来源表不存在，自动创建一个外部表记录
-                    print(f"  📥 自动创建外部表记录: {source_table_full_name}")
+                    # 来源表不存在，自动创建外部表记录
+                    print(f"  📥 自动创建外部表记录: {source_schema}.{source_name}")
                     _create_external_table_record(cursor, source_schema, source_name)
-                    # 重新生成source_table_id（外部表没有script_id）
                     source_table_id = _generate_table_id(source_schema, source_name, None)
             
             # 生成lineage_id
-            lineage_id = f"{target_table_id}__{source_table_id}__{script_id}"
+            lineage_id = f"{target_table_id}__{source_table_id}__{statement_id}"
             
-            # 插入或更新data_lineage
+            # 插入data_lineage_detail
             cursor.execute("""
-                INSERT OR REPLACE INTO data_lineage (
-                    id, target_table_id, source_table_id, script_id,
-                    lineage_type, transformation_logic, columns_mapping_json, filter_conditions
-                ) VALUES (?, ?, ?, ?, '', '', '', '')
+                INSERT OR REPLACE INTO data_lineage_detail (
+                    id, target_table_id, source_table_id, script_id, statement_id,
+                    transformation_logic, filter_conditions
+                ) VALUES (?, ?, ?, ?, ?, '', '')
             """, (
                 lineage_id,
                 target_table_id,
                 source_table_id,
-                script_id
+                script_id,
+                statement_id
             ))
+            lineage_count += 1
     
-    # 3. 填充script_dependencies表 - 为每个来源表创建一条记录
-    for source_table_full_name in source_tables:
-        source_schema, source_name = _parse_full_table_name(source_table_full_name)
-        
-        # 尝试查找来源表（先尝试实体表，再尝试临时表）
-        source_table_id = _generate_table_id(source_schema, source_name, None)
-        cursor.execute("SELECT id FROM tables WHERE id = ?", (source_table_id,))
-        
-        if not cursor.fetchone():
-            # 如果实体表不存在，尝试查找临时表（使用当前script_id）
-            source_table_id = _generate_table_id(source_schema, source_name, script_id)
-            cursor.execute("SELECT id FROM tables WHERE id = ?", (source_table_id,))
-            
-            if not cursor.fetchone():
-                # 来源表不存在，自动创建外部表记录（如果还未创建）
-                _create_external_table_record(cursor, source_schema, source_name)
-                # 重新生成source_table_id（外部表没有script_id）
-                source_table_id = _generate_table_id(source_schema, source_name, None)
-        
-        # 生成dependency_id
-        dependency_id = f"{source_table_id}__{script_id}"
-        
-        # 插入或更新script_dependencies
-        cursor.execute("""
-            INSERT OR REPLACE INTO script_dependencies (
-                id, script_id, source_table_id, dependency_type,
-                usage_pattern, columns_used_json, join_conditions, filter_conditions
-            ) VALUES (?, ?, ?, '', '', '', '', '')
-        """, (
-            dependency_id,
-            script_id,
-            source_table_id
-        ))
+    print(f"  ✅ 已填充 {lineage_count} 条血缘记录")
+    
+    # 4. 生成data_lineage_summary（从detail推导）
+    print(f"  🔄 正在生成summary...")
+    try:
+        from lineage_graph_manager import generate_lineage_summary
+        generate_lineage_summary(cursor, script_id)
+    except Exception as e:
+        print(f"  ⚠️  Summary生成失败: {e}")
+        # 不影响主流程
 
 
 def _update_global_lineage(

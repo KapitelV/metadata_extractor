@@ -64,6 +64,94 @@ def extract_insert_metadata(sql: str, dialect: str = None) -> Dict:
     return extract_sql_metadata(sql, dialect)
 
 
+def _resolve_update_table_alias(update_sql: exp.Update, table_expr: exp.Table) -> exp.Table:
+    """
+    解析UPDATE语句中的别名映射，将别名映射到真实表名
+    
+    在某些数据库（如SQL Server、Teradata）中，UPDATE语句可以使用如下语法：
+    UPDATE alias FROM table_name alias SET ...
+    此时UPDATE后跟的是别名而不是真正的表名，需要从FROM子句中找到真实表名。
+    
+    Args:
+        update_sql: UPDATE语句的AST
+        table_expr: UPDATE语句的this（可能是别名）
+    
+    Returns:
+        真实的表对象，如果无法解析则返回原table_expr
+    """
+    # 如果没有FROM子句，直接返回原表达式
+    from_clause = update_sql.args.get('from')
+    if not from_clause:
+        return table_expr
+    
+    # 如果table_expr不是Table类型，直接返回
+    if not isinstance(table_expr, exp.Table):
+        return table_expr
+    
+    # 提取UPDATE后的表名（可能是别名）
+    possible_alias = None
+    if hasattr(table_expr.this, 'this'):
+        possible_alias = table_expr.this.this
+    else:
+        possible_alias = str(table_expr.this)
+    
+    # 检查UPDATE后的表是否有schema，如果有schema则很可能不是别名
+    has_schema = False
+    if table_expr.db:
+        has_schema = True
+    
+    # 如果已经有schema，且UPDATE的this就是一个完整的表引用，可能不需要映射
+    # 但仍然检查FROM子句中是否有匹配的别名
+    
+    # 在FROM子句中查找表及其别名
+    from_tables = []
+    for table in from_clause.find_all(exp.Table):
+        from_tables.append(table)
+    
+    # 遍历FROM子句中的表，查找别名匹配
+    for from_table in from_tables:
+        # 获取FROM表的别名
+        table_alias = None
+        if hasattr(from_table, 'alias'):
+            table_alias = from_table.alias
+            if isinstance(table_alias, exp.TableAlias):
+                # 从TableAlias中提取别名名称
+                if hasattr(table_alias, 'this'):
+                    if hasattr(table_alias.this, 'this'):
+                        table_alias = table_alias.this.this
+                    else:
+                        table_alias = str(table_alias.this)
+            elif isinstance(table_alias, str):
+                pass  # 已经是字符串
+            elif hasattr(table_alias, 'this'):
+                table_alias = table_alias.this
+            else:
+                table_alias = str(table_alias)
+        
+        # 如果找到别名匹配，返回FROM子句中的真实表
+        if table_alias and table_alias == possible_alias:
+            return from_table
+    
+    # 如果没有找到别名匹配，检查是否有单个表的情况
+    # 在某些情况下，UPDATE alias FROM table_name，但FROM中的表没有明确写别名
+    # 这时如果FROM中只有一个表且UPDATE后没有schema，可能UPDATE后的就是别名
+    if not has_schema and len(from_tables) == 1:
+        # 获取FROM中唯一表的名称
+        from_table = from_tables[0]
+        from_table_name = None
+        if hasattr(from_table.this, 'this'):
+            from_table_name = from_table.this.this
+        else:
+            from_table_name = str(from_table.this)
+        
+        # 如果UPDATE后的名称与FROM表名称不同，说明UPDATE后的是别名
+        if from_table_name != possible_alias:
+            return from_table
+    
+    # 无法确定映射关系，返回原表达式
+    return table_expr
+
+
 def _extract_target_table(parsed_sql: exp.Expression) -> Dict[str, str]:
     """
     提取目标表信息（支持INSERT/UPDATE/MERGE/CREATE TABLE AS）
@@ -84,9 +172,11 @@ def _extract_target_table(parsed_sql: exp.Expression) -> Dict[str, str]:
         if isinstance(table_expr, exp.Schema):
             table_expr = table_expr.this
     
-    # UPDATE语句
+    # UPDATE语句 - 需要处理别名映射
     elif isinstance(parsed_sql, exp.Update):
         table_expr = parsed_sql.this
+        # 调用辅助函数处理UPDATE语句的别名映射
+        table_expr = _resolve_update_table_alias(parsed_sql, table_expr)
     
     # MERGE语句
     elif isinstance(parsed_sql, exp.Merge):
@@ -908,9 +998,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"错误: {e}")
     
-    # 测试用例2：UPDATE语句
+    # 测试用例2：UPDATE语句（传统语法）
     print("\n" + "=" * 70)
-    print("示例2：UPDATE语句")
+    print("示例2：UPDATE语句（传统语法）")
     print("=" * 70)
     update_sql = """
     UPDATE employees
@@ -923,6 +1013,26 @@ if __name__ == "__main__":
     try:
         result = extract_sql_metadata(update_sql)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(f"错误: {e}")
+    
+    # 测试用例2b：UPDATE语句（带别名映射）
+    print("\n" + "=" * 70)
+    print("示例2b：UPDATE语句（带别名映射 - SQL Server/Teradata风格）")
+    print("=" * 70)
+    update_sql_alias = """
+    UPDATE t
+    FROM schema1.employees t
+    SET 
+        t.salary = t.salary * 1.1,  /* 工资 */
+        t.updated_at = CURRENT_TIMESTAMP  /* 更新时间 */
+    WHERE t.department_id = 100
+    """
+    
+    try:
+        result = extract_sql_metadata(update_sql_alias, dialect='tsql')
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print("注：成功将别名't'映射到真实表名'schema1.employees'")
     except Exception as e:
         print(f"错误: {e}")
     
