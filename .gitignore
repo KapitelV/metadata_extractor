@@ -148,3 +148,7 @@ sqlglot/_version.py
 .git
 .git/
 
+dw_metadata.db
+datalineage.json
+batch_process_log.txt
+datalineage/
